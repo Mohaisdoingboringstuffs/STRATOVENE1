@@ -1,0 +1,555 @@
+from flask import Flask, request, jsonify, send_from_directory, Response
+import json as _json
+import logging
+import os
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+import uuid
+import threading
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+
+from atmosphere import atmosphere_at
+
+# Import model components
+from config import SimulationConfig
+from materials import load_materials
+from enclosure import solve_steady
+from transient import simulate_24h
+from spectral import thermal_wavelengths_m, solar_wavelengths_m
+from solar import default_broadband, solar_position
+from uncertainty import monte_carlo, sensitivity
+from validation import diaz_lobo_reproduction
+from experiments import load_experiment_csv, metrics as exp_metrics
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+ROOT_DIR = Path(__file__).resolve().parent
+
+app = Flask(
+    __name__,
+    static_folder=str(ROOT_DIR / 'webapp' / 'static'),
+    template_folder=str(ROOT_DIR / 'webapp' / 'templates'),
+    static_url_path='',
+)
+
+# Model Versioning
+def get_git_commit():
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
+    except Exception:
+        return "unknown"
+
+def get_git_commit_date():
+    """Commit date of the current HEAD, so the version date is reproducible."""
+    try:
+        return subprocess.check_output(
+            ['git', 'show', '-s', '--format=%ad', '--date=short', 'HEAD']
+        ).decode('ascii').strip()
+    except Exception:
+        return "unknown"
+
+MODEL_VERSION = "1.0.0"
+GIT_COMMIT = get_git_commit()
+MODEL_DATE = get_git_commit_date()
+
+# Known limitations as per requirements
+KNOWN_LIMITATIONS = [
+    "No validation against measurements - every number is a model output, not flight data",
+    "Convection is the single biggest lever at altitude: at 5 m/s and 20 km the flat-plate correlation gives h ~ 4.6 W/m2K, which moves more heat than radiation. A free-floating platform sees less wind; a powered HALE glider sees more. The h value is shown with every result",
+    "The DLR +190 C unmitigated anchor is radiation-dominated at DLR's geometry; this model's bare-aluminum cases will NOT reproduce it while convection is on - that difference is the point of the wind slider",
+    "Benchmark does not reproduce the paper exactly (peak cooling vs 175 W/m2, deltaT definition mismatch: paper reports vs empty-box reference, not bare-Al contrast)",
+    "Broadband Dai-Fang sky model used in the benchmark; layered band model used elsewhere",
+    "Electronics heat load is a scenario value (5-50 W), not measured avionics power"
+]
+
+# Range validation helpers
+ALLOWED_RANGES = {
+    "altitude": (0, 25000),
+    "wind": (0, 100),
+    "heat_load": (0, 500),
+    "solar_scale": (0, 2.0),
+    "mc_n": (1, 10000)
+}
+
+def validate_range(name, value):
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    low, high = ALLOWED_RANGES.get(name, (-float('inf'), float('inf')))
+    if not (low <= value <= high):
+        raise ValueError(f"{name} out of range ({low} to {high})")
+
+# Background Job Store for Monte Carlo.
+# In-process only: cleared on restart. Capped by pruning finished jobs when
+# MAX_JOBS is exceeded so long-running servers cannot leak memory unboundedly.
+jobs = {}
+jobs_lock = threading.Lock()
+MAX_JOBS = 40
+
+def _prune_jobs_locked():
+    """Drop oldest completed/failed entries while over MAX_JOBS (insertion-ordered dict)."""
+    while len(jobs) > MAX_JOBS:
+        done_ids = [k for k, v in jobs.items() if v.get("status") in ("completed", "failed")]
+        if not done_ids:
+            break
+        jobs.pop(done_ids[0])
+
+def run_mc_job(job_id, cfg, material, altitude, n, seed):
+    try:
+        # Use a copy of config for thread safety
+        local_cfg = deepcopy(cfg)
+        local_cfg.uncertainty.seed = seed
+        res = monte_carlo(local_cfg, material, altitude, n)
+        result = {
+            "mean": res.mean,
+            "median": res.median,
+            "p5": res.p5,
+            "p95": res.p95,
+            "std": res.std,
+            "histogram": res.t_electronics_c.tolist()
+        }
+        with jobs_lock:
+            jobs[job_id] = {"status": "completed", "result": result}
+    except Exception as e:
+        logger.error(f"MC Job {job_id} failed: {e}")
+        with jobs_lock:
+            jobs[job_id] = {"status": "failed", "error": str(e)}
+
+@app.route('/')
+def index():
+    return send_from_directory(str(ROOT_DIR / 'webapp' / 'static'), 'index.html')
+
+def _favicon_ico_bytes(size=16, bgra=(0xFF, 0x6B, 0x1A, 0xFF)):
+    px = bytes(bgra) * (size * size)
+    stride = ((size // 8) + 3) // 4 * 4
+    mask = bytes(stride * size)
+    header = struct.pack('<IiiHHIIiiII', 40, size, size * 2, 1, 32, 0, len(px) + len(mask), 0, 0, 0, 0)
+    image = header + px + mask
+    icon_dir = struct.pack('<HHH', 0, 1, 1)
+    entry = struct.pack('<BBBBHHII', size, size, 0, 0, 1, 32, len(image), len(icon_dir) + 16)
+    return icon_dir + entry + image
+
+_FAVICON_ICO = _favicon_ico_bytes()
+
+@app.route('/favicon.ico')
+def favicon():
+    return Response(_FAVICON_ICO, mimetype='image/x-icon')
+
+@app.route('/api/meta', methods=['GET'])
+def api_meta():
+    mats = load_materials()
+    return jsonify({
+        "version": MODEL_VERSION,
+        "commit": GIT_COMMIT,
+        "date": MODEL_DATE,
+        "limitations": KNOWN_LIMITATIONS,
+        "ranges": ALLOWED_RANGES,
+        "materials": [
+            {
+                "id": mid,
+                "name": m.name,
+                "alpha": m.solar_absorptance,
+                "epsilon": m.ir_emissivity,
+                "status": m.status.value if hasattr(m.status, "value") else str(m.status),
+            }
+            for mid, m in mats.items()
+        ],
+        "defaults": {
+            "altitude": 20000,
+            "wind": 5.0,
+            "heat_load": 20.0,
+            "solar_scale": 1.0
+        }
+    })
+
+
+def _resolve_solar_scale(cfg: SimulationConfig, alt: float, solar_scale: float) -> bool:
+    """Make the solar-scale knob real.
+
+    With no explicit irradiance override, the model computes an internal
+    altitude-dependent clear-sky estimate. If the caller asks for a scale
+    other than 1.0, we compute that internal estimate, scale it, and pin
+    it as the override so the scaling is actually applied.
+    Returns True if an override was set.
+    """
+    if solar_scale == 1.0:
+        return False
+    env = cfg.environment
+    dt = datetime(env.year, env.month, env.day, tzinfo=timezone.utc) + timedelta(hours=env.utc_hour)
+    atm = atmosphere_at(alt, env.relative_humidity_surface, env.stratospheric_h2o_ppmv, env.precipitable_water_mm)
+    pos = solar_position(env.latitude_deg, env.longitude_deg, dt)
+    g_dir, g_dif = default_broadband(
+        alt, pos, None, env.irradiance_diffuse_w_m2, env.sky_condition, env.cloud_fraction
+    )
+    env.irradiance_direct_w_m2 = g_dir * solar_scale
+    env.irradiance_diffuse_w_m2 = g_dif * solar_scale
+    return True
+
+@app.route('/api/altitude', methods=['POST'])
+def api_altitude():
+    data = request.json
+    try:
+        mats_requested = data.get('materials', [])
+        alt = data.get('altitude')
+        wind = data.get('wind')
+        heat = data.get('heat_load')
+        solar_scale = data.get('solar_scale', 1.0)
+
+        validate_range('altitude', alt)
+        validate_range('wind', wind)
+        validate_range('heat_load', heat)
+        validate_range('solar_scale', solar_scale)
+
+        cfg = SimulationConfig()
+        cfg.environment.altitude_m = alt
+        cfg.environment.wind_speed_m_s = wind
+        cfg.electronics.heat_load_w = heat
+        # solar_scale now really scales the internal clear-sky estimate when 1.0
+        # is not requested (see _resolve_solar_scale).
+        solar_scale_applied = _resolve_solar_scale(cfg, alt, solar_scale)
+
+        all_mats = load_materials()
+        results = {}
+        for m_id in mats_requested:
+            if m_id not in all_mats:
+                return jsonify({"error": f"Unknown material {m_id}"}), 400
+            mat = all_mats[m_id]
+            sol = solve_steady(cfg, mat, altitude_m=alt, wind=wind, heat_w=heat)
+            results[m_id] = {
+                "t_electronics": sol.t_electronics_c,
+                "t_surface": sol.t_surface_c,
+                "t_wall": sol.t_wall_c,
+                "q_env": {
+                    "rad": sol.q_env_rad_net_w,
+                    "conv": sol.q_env_conv_w,
+                    "solar": sol.q_env_solar_w
+                },
+                "residual": sol.relative_energy_error,
+                "h_conv": sol.h_w_m2_k,
+                "mass_al_kg": sol.mass.aluminum_kg,
+                "mass_aao_kg": sol.mass.aao_kg,
+                "metadata": {
+                    "altitude": "MODELED",
+                    "wind": "ASSUMED",
+                    "heat_load": "ASSUMED"
+                }
+            }
+
+        atm = atmosphere_at(alt)
+        from radiation import effective_sky_temperature
+        t_sky_k, _eps_sky = effective_sky_temperature(atm)
+
+        return jsonify({
+            "results": results,
+            "scenario": {
+                "altitude_m": alt,
+                "t_air_c": atm.temperature_k - 273.15,
+                "t_sky_c": t_sky_k - 273.15,
+                "pressure_ratio": atm.pressure_pa / 101325.0,
+                "density_ratio": atm.density_kg_m3 / 1.225,
+                "wind": wind,
+                "heat": heat,
+                "solar_scale": solar_scale,
+            },
+            "metadata": {
+                "version": MODEL_VERSION,
+                "commit": GIT_COMMIT,
+                "solar_scale_applied": solar_scale_applied
+            }
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Altitude API error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/sweep', methods=['POST'])
+def api_sweep():
+    """Altitude sweep for the T-vs-altitude chart (server-side loop)."""
+    data = request.json
+    try:
+        mats_requested = data.get('materials', [])
+        wind = data.get('wind')
+        heat = data.get('heat_load')
+        altitudes = data.get('altitudes_km')
+        if not isinstance(altitudes, list) or not (1 <= len(altitudes) <= 60):
+            altitudes = [0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0, 22.5, 25.0]
+
+        all_mats = load_materials()
+        results = {m: {"alt_km": [], "t_electronics": [], "t_surface": []} for m in mats_requested}
+        t_air_profile = []
+        scenario = None
+        for km in altitudes:
+            alt = float(km) * 1000.0
+            validate_range('altitude', alt)
+            validate_range('wind', wind)
+            validate_range('heat_load', heat)
+            cfg = SimulationConfig()
+            cfg.environment.altitude_m = alt
+            cfg.environment.wind_speed_m_s = wind
+            cfg.electronics.heat_load_w = heat
+            atm = atmosphere_at(alt)
+            t_air_profile.append({"alt_km": float(km), "t_air_c": atm.temperature_k - 273.15})
+            for m_id in mats_requested:
+                if m_id not in all_mats:
+                    return jsonify({"error": f"Unknown material {m_id}"}), 400
+                sol = solve_steady(cfg, all_mats[m_id], altitude_m=alt, wind=wind, heat_w=heat)
+                results[m_id]["alt_km"].append(float(km))
+                results[m_id]["t_electronics"].append(sol.t_electronics_c)
+                results[m_id]["t_surface"].append(sol.t_surface_c)
+        return jsonify({
+            "results": results,
+            "t_air_profile": t_air_profile,
+            "metadata": {"version": MODEL_VERSION, "commit": GIT_COMMIT}
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Sweep API error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route('/api/team', methods=['GET'])
+def api_team():
+    path = ROOT_DIR / 'data' / 'team.json'
+    try:
+        return Response(path.read_text(encoding='utf-8'), mimetype='application/json')
+    except Exception:
+        return jsonify({"members": [], "anchors": [], "error": "team data unavailable"})
+
+
+@app.route('/api/activity', methods=['GET'])
+def api_activity():
+    path = ROOT_DIR / 'data' / 'activity.json'
+    try:
+        return Response(path.read_text(encoding='utf-8'), mimetype='application/json')
+    except Exception:
+        return jsonify({"entries": [], "updated": None, "error": "activity data unavailable"})
+
+
+@app.route('/api/transient', methods=['POST'])
+def api_transient():
+    data = request.json
+    try:
+        mats_requested = data.get('materials', [])
+        alt = data.get('altitude')
+        wind = data.get('wind')
+        heat = data.get('heat_load')
+        
+        validate_range('altitude', alt)
+        validate_range('wind', wind)
+        validate_range('heat_load', heat)
+
+        cfg = SimulationConfig()
+        cfg.environment.altitude_m = alt
+        cfg.environment.wind_speed_m_s = wind
+        cfg.electronics.heat_load_w = heat
+
+        all_mats = load_materials()
+        atm = atmosphere_at(alt)
+        results = {}
+        for m_id in mats_requested:
+            if m_id not in all_mats:
+                return jsonify({"error": f"Unknown material {m_id}"}), 400
+            mat = all_mats[m_id]
+            tr = simulate_24h(cfg, mat, altitude_m=alt)
+            t_e_c = (tr.t_electronics_k - 273.15).tolist()
+            t_w_c = (tr.t_wall_k - 273.15).tolist()
+            results[m_id] = {
+                "time": tr.time_s.tolist(),
+                "t_electronics": t_e_c,
+                "t_wall": t_w_c,
+                "t_air_c": atm.temperature_k - 273.15,
+                "metrics": {
+                    "min": tr.t_min_c,
+                    "max": tr.t_max_c,
+                    "swing": tr.swing_k,
+                    "overcool_risk": tr.t_min_c < 0.0,
+                    "overheat_above_50": tr.t_max_c > 50.0,
+                }
+            }
+        return jsonify({
+            "results": results,
+            "metadata": {
+                "version": MODEL_VERSION,
+                "commit": GIT_COMMIT,
+                "t_air_c": atm.temperature_k - 273.15,
+            }
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Transient API error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/spectral', methods=['POST'])
+def api_spectral():
+    data = request.json
+    try:
+        mats_requested = data.get('materials', [])
+        all_mats = load_materials()
+        results = {}
+        
+        temp_k = 293.15
+        wav_solar = solar_wavelengths_m()
+        wav_thermal = thermal_wavelengths_m()
+        
+        for m_id in mats_requested:
+            if m_id not in all_mats:
+                return jsonify({"error": f"Unknown material {m_id}"}), 400
+            mat = all_mats[m_id]
+            # Serve the model's own Kirchhoff-consistent spectral accessors
+            # (interpolates the material's spectral data; falls back to
+            # band-representatives when no CSV spectrum exists).
+            results[m_id] = {
+                "solar": {
+                    "wavelength": wav_solar.tolist(),
+                    "reflectance": mat.reflectance_on(wav_solar).tolist()
+                },
+                "thermal": {
+                    "wavelength": wav_thermal.tolist(),
+                    "emissivity": mat.epsilon_on(wav_thermal).tolist()
+                }
+            }
+        return jsonify({
+            "results": results,
+            "window": [8.0, 13.0],
+            "metadata": {"version": MODEL_VERSION}
+        })
+    except Exception as e:
+        logger.error(f"Spectral API error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/montecarlo', methods=['POST'])
+def api_montecarlo():
+    data = request.json
+    try:
+        mat_id = data.get('material')
+        alt = data.get('altitude')
+        n = data.get('n', 2000)
+        seed = data.get('seed', 42)
+        
+        validate_range('altitude', alt)
+        validate_range('mc_n', n)
+        
+        all_mats = load_materials()
+        if mat_id not in all_mats:
+            return jsonify({"error": "Unknown material"}), 400
+            
+        job_id = str(uuid.uuid4())
+        cfg = SimulationConfig()
+        cfg.environment.altitude_m = alt
+
+        with jobs_lock:
+            _prune_jobs_locked()
+            jobs[job_id] = {"status": "pending"}
+        # daemon=True so a long MC cannot block process shutdown
+        thread = threading.Thread(target=run_mc_job, args=(job_id, cfg, all_mats[mat_id], alt, n, seed), daemon=True)
+        thread.start()
+        
+        return jsonify({"job_id": job_id, "status": "pending"})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"MC Start error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/jobs/<job_id>', methods=['GET'])
+def api_job_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
+@app.route('/api/sensitivity', methods=['POST'])
+def api_sensitivity():
+    data = request.json
+    try:
+        mat_id = data.get('material')
+        alt = data.get('altitude')
+        
+        validate_range('altitude', alt)
+        
+        all_mats = load_materials()
+        if mat_id not in all_mats:
+            return jsonify({"error": "Unknown material"}), 400
+            
+        cfg = SimulationConfig()
+        cfg.environment.altitude_m = alt
+        res = sensitivity(cfg, all_mats[mat_id], alt)
+        
+        return jsonify({
+            "tornado": res.tornado,
+            "next_experiment": res.next_experiment,
+            "metadata": {"version": MODEL_VERSION}
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Sensitivity API error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/benchmark', methods=['POST'])
+def api_benchmark():
+    data = request.json
+    try:
+        cfg = SimulationConfig()
+        res = diaz_lobo_reproduction(cfg)
+        return jsonify({
+            "reported": res.reported,
+            "modeled": res.modeled,
+            "discrepancy": res.discrepancy,
+            "notes": res.notes,
+            "metadata": {"version": MODEL_VERSION}
+        })
+    except Exception as e:
+        logger.error(f"Benchmark API error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/experiment/example', methods=['GET'])
+def api_experiment_example():
+    df = load_experiment_csv()
+    cfg = SimulationConfig()
+    met = exp_metrics(df, cfg=cfg)
+    return jsonify({
+        "metrics": met.__dict__,
+        "data_source": "SYNTHETIC EXAMPLE",
+        "metadata": {"version": MODEL_VERSION}
+    })
+
+@app.route('/api/experiment', methods=['POST'])
+def api_experiment_upload():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+    
+    try:
+        # Save to a system temp dir (NOT the publicly served static folder) and
+        # always delete, including on parse failure.
+        fd, tmp_path = tempfile.mkstemp(suffix=".csv", prefix="stratovane_upload_")
+        os.close(fd)
+        try:
+            file.save(tmp_path)
+            df = load_experiment_csv(tmp_path)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        cfg = SimulationConfig()
+        met = exp_metrics(df, cfg=cfg)
+        return jsonify({
+            "metrics": met.__dict__,
+            "data_source": "user-uploaded",
+            "metadata": {"version": MODEL_VERSION}
+        })
+    except Exception as e:
+        logger.error(f"Experiment upload error: {e}")
+        return jsonify({"error": str(e)}), 400
+
+if __name__ == '__main__':
+    app.run(debug=False)

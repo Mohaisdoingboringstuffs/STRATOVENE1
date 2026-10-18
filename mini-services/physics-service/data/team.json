@@ -1,0 +1,72 @@
+{
+  "note": "TEAM ROSTER. Edit this file to update names, roles, grades, schools and links; the site renders it automatically on the Team page.",
+  "project": "STRATOVANE",
+  "tagline": "Passive radiative thermal control for stratospheric avionics",
+  "mentor": {
+    "name": "Dr Rani Nasrin",
+    "role": "Mentor",
+    "initials": "RN",
+    "detail": "PhD in Plasma Physics. Head of the Physics Department, Dhaka Residential Model College."
+  },
+  "members": [
+    {
+      "id": "mohaimen",
+      "name": "Mohaimen Ul Haque",
+      "role": "Team Lead",
+      "initials": "MH",
+      "grade": "11th grade",
+      "school": "Dhaka Residential Model College",
+      "focus": "Project direction, web and systems integration.",
+      "links": [
+        { "label": "GitHub", "url": "https://github.com/Mohaisdoingboringstuffs" }
+      ]
+    },
+    {
+      "id": "rafsan",
+      "name": "Rafsan Ahmed",
+      "role": "Team Member",
+      "initials": "RA",
+      "grade": "11th grade",
+      "school": "Dhaka Residential Model College",
+      "links": []
+    },
+    {
+      "id": "omera",
+      "name": "Omera Fidan",
+      "role": "Team Member",
+      "initials": "OF",
+      "grade": "9th grade",
+      "school": "Chattogram Cantonment Public College",
+      "links": []
+    },
+    {
+      "id": "abul",
+      "name": "Abul Hasnat",
+      "role": "Team Member",
+      "initials": "AH",
+      "grade": "11th grade",
+      "school": "Cumilla Victoria Government College",
+      "links": [
+        { "label": "GitHub", "url": "https://github.com/Hasnat4763" }
+      ]
+    }
+  ],
+  "advisors": [],
+  "anchors": [
+    {
+      "label": "CSIC 2024 (core reference)",
+      "detail": "Díaz-Lobo et al., ACS Appl. Opt. Mater. 2024, 2, 980-990. doi:10.1021/acsaom.3c00216",
+      "url": "https://doi.org/10.1021/acsaom.3c00216"
+    },
+    {
+      "label": "DLR 2022 (190 C anchor)",
+      "detail": "Beneitez Ortega C., Thermal Management of Electrical Systems in a Solar-Electric Stratosphere HALE. elib.dlr.de/187412",
+      "url": "https://elib.dlr.de/187412/"
+    },
+    {
+      "label": "Beihang 2023 (flight-tested film competitor)",
+      "detail": "Fu et al., Adv. Space Res. 72 (2023) 541. doi:10.1016/j.asr.2023.03.004",
+      "url": "https://doi.org/10.1016/j.asr.2023.03.004"
+    }
+  ]
+}

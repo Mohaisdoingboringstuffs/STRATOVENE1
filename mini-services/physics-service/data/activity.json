@@ -1,0 +1,60 @@
+{
+  "note": "PROJECT ACTIVITY LOG. Real, dated milestones. Newest first. Add entries as work happens; the site renders this file verbatim.",
+  "updated": "2026-10-18",
+  "entries": [
+    {
+      "date": "2026-10-18",
+      "tag": "SITE",
+      "title": "Site v2.1: real roster, manual value entry, rebuilt header and footer",
+      "detail": "Team page now carries the real roster and mentor. Simulator inputs accept typed values in sync with the sliders (Enter commits, arrow keys step, out-of-range input snaps to the nearest valid value). Header rebuilt with a project mark and numbered navigation; footer now lists contact details, the GitHub repository and developer credits."
+    },
+    {
+      "date": "2026-10-18",
+      "tag": "SITE",
+      "title": "Website v2 rebuilt: minimal UI, live simulator, team and activity pages",
+      "detail": "Frontend rebuilt around the honest model: real altitude-sweep curves, convection transparency (h is now displayed), day/night shading with the 0 C lower-limit line, material picker with alpha/epsilon shown. Backend remains Python (Flask) running the validated heat-balance model."
+    },
+    {
+      "date": "2026-10-18",
+      "tag": "SIM",
+      "title": "Physics re-verified against independent band model",
+      "detail": "US76 atmosphere: T_air = -56.5 C at 20 km (correct). Sea-level pressure ratio 5.5% (density ratio 7.3%; different quantities, both correct). Energy residuals ~1e-16 on all steady solves. Convection at 5 m/s / 20 km gives h ~ 4.6 W/m2K and dominates the budget, now displayed explicitly instead of hidden."
+    },
+    {
+      "date": "2026-10-18",
+      "tag": "SIM",
+      "title": "Night overcooling risk (audit finding C13) visible in simulator",
+      "detail": "24 h transient shows the treated box can spend the entire day below 0 C at 20 km with a 20 W load under high-emissivity optics plus convection. The simulator now draws the 0 C electronics lower-limit line and flags overcooling risk instead of only reporting overheating."
+    },
+    {
+      "date": "2026-10-17",
+      "tag": "AUDIT",
+      "title": "Full submission audit completed: 35 claims tracked, 23 verified, 13 corrections",
+      "detail": "Line-by-line audit against the CSIC paper (Diaz-Lobo 2024), the official Lean Canvas template, and online sources. Key corrections: 20 km is ~2x jet cruise altitude (not 6x); the 8.0 C result is vs an insulated reference box; 17 g/m2 is a NET mass gain; the Chinese film result is a 2023 stratospheric flight test (15.4 C below control), not a blimp; AeroVironment reference replaced."
+    },
+    {
+      "date": "2026-10-17",
+      "tag": "DOC",
+      "title": "190 C overheating claim traced to its source (DLR 2022)",
+      "detail": "Located and read the DLR report (Beneitez Ortega, elib.dlr.de/187412): -60 to +190 C avionics prediction at 20 km for the UNMITIGATED PDU (anodized aluminum, emissivity 0.15). DLR's own fix: white paint, black paint, conductive plates, heat sinks, i.e., the same passive-control family STRATOVANE proposes."
+    },
+    {
+      "date": "2026-10-17",
+      "tag": "DOC",
+      "title": "Corrected documents pack generated",
+      "detail": "Corrected technical summary, corrected chemistry protocol (Faraday cross-check added: 12 um needs ~675 C of charge, 1-3 h at stated currents), and a corrected 12-box Lean Canvas - all within official word limits."
+    },
+    {
+      "date": "2026-10-16",
+      "tag": "SIM",
+      "title": "Mass-gain calibration corrected",
+      "detail": "Independent re-derivation: 55.8 mg at 12 um (previous 100 mg value implies ~21.5 um). 17 g/m2 confirmed as NET mass gain (gross oxide ~36 g/m2). Paint-mass comparison now uses the 400 um thickness basis required for full solar reflectance (Li et al. 2021)."
+    },
+    {
+      "date": "2026-10-15",
+      "tag": "EXPERIMENT",
+      "title": "Competitor verification: Beihang metamaterial film",
+      "detail": "Fu et al. 2023 verified real: ground tests in Tianjin (6.7 C noon specimen delta) and stratospheric flight experiments with maximum temperature 15.4 C below control. Best competing result, and it is a bonded layer that can delaminate; STRATOVANE grows the surface instead of gluing it."
+    }
+  ]
+}

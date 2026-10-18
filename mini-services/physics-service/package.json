@@ -1,0 +1,8 @@
+{
+  "name": "physics-service",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "PYTHONPATH=. python3 -m flask --app app run --host 127.0.0.1 --port 5001 --with-threads"
+  }
+}

@@ -1,0 +1,9 @@
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+flask>=3.0
+# Dev-only (not needed by the deployed service; commented out to keep the
+# Vercel services image small and builds fast):
+# pytest>=7.0
+# jupyter>=1.0
